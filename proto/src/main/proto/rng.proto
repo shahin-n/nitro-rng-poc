@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package rng.v1;
+
+option java_multiple_files = true;
+option java_package = "com.mario.rng.proto";
+option java_outer_classname = "RngProto";
+
+// ----------------------------------------------------------------------------
+// TRANSPORT contract — game-service <-> proxy-service (gRPC) and relayed
+// proxy-service <-> rng-service (vsock).
+//
+// ZERO TRUST: the proxy, the EC2 host and the vsock are untrusted. They only
+// ever see the fields below — a public attestation document and OPAQUE
+// ciphertext. No RNG semantics, no plaintext, ever cross this boundary.
+// The real request/response live encrypted inside SealedMessage.ciphertext
+// (see app.proto), readable only by the enclave and the game.
+// ----------------------------------------------------------------------------
+service RngService {
+  // Step B — Connect / Attest. Plaintext, all fields public.
+  // Game sends a fresh 32-byte nonce; enclave returns the NSM-signed
+  // COSE_Sign1 attestation document (bound to that nonce + its ephemeral keys).
+  rpc Attest (AttestRequest) returns (AttestReply);
+
+  // Step C — Serve. Opaque HPKE ciphertext both ways (sign-then-encrypt).
+  // The proxy relays bytes; only the enclave/game can read them.
+  rpc Serve (SealedMessage) returns (SealedMessage);
+}
+
+message AttestRequest {
+  bytes client_nonce = 1; // 32 random bytes, one-time
+}
+
+message AttestReply {
+  bytes attestation_doc = 1; // COSE_Sign1 CBOR (NSM attestation document)
+}
+
+message SealedMessage {
+  bytes ciphertext = 1; // HPKE: enc(KEM) || AEAD ciphertext+tag — opaque to proxy
+}

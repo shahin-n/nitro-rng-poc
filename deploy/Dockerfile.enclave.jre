@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+#
+# RNG Engine enclave image — JRE variant (no GraalVM).
+# Robust fallback: runs the shaded jar on a JRE inside the enclave.
+# Bigger EIF than native, but no native-image reflection/FFM build fights.
+#
+# Build context = repo root:
+#   docker build -f deploy/Dockerfile.enclave.jre -t rng-engine:latest .
+
+# ---- Stage 1: build the uber jar --------------------------------------------
+FROM maven:3.9-eclipse-temurin-24 AS jar
+WORKDIR /src
+COPY . .
+RUN mvn -q -B -pl rng-service -am -DskipTests package
+
+# ---- Stage 2: enclave runtime -----------------------------------------------
+FROM eclipse-temurin:24-jre
+COPY --from=jar /src/rng-service/target/rng-service.jar /rng-service.jar
+ENV RNG_VSOCK_PORT=5005
+# absolute java path — the enclave init's execvpe uses a minimal PATH
+ENTRYPOINT ["/opt/java/openjdk/bin/java", "--enable-native-access=ALL-UNNAMED", "-jar", "/rng-service.jar"]

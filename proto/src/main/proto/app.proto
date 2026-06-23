@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package rng.app.v1;
+
+option java_multiple_files = true;
+option java_package = "com.mario.rng.app";
+option java_outer_classname = "AppProto";
+
+// ----------------------------------------------------------------------------
+// APPLICATION payload — confidential. These messages exist ONLY inside the
+// HPKE ciphertext of SealedMessage. The proxy/host NEVER see them decoded.
+//
+// Request : Game -> HPKE(enc_pub, SealedRequest)
+// Response: Engine -> HPKE(game_pub, SignedResult{ result, req_nonce, sig })
+// ----------------------------------------------------------------------------
+
+// Plaintext sealed under the enclave's enc_pub (from the attestation doc).
+message SealedRequest {
+  bytes op = 1;         // serialized RngOp
+  bytes game_pub = 2;   // game's ephemeral X25519 pub — enclave seals reply to it
+  bytes req_nonce = 3;  // 16 random bytes, echoed in the signed reply (anti-replay)
+}
+
+// Enclave reply: result is SIGNED (ECDSA/sign_priv) then the whole struct is
+// HPKE-sealed to game_pub.
+message SignedResult {
+  bytes result = 1;     // serialized RngResult
+  bytes req_nonce = 2;  // must equal the request's req_nonce
+  bytes signature = 3;  // ECDSA-P384/SHA-384 over (result || req_nonce), verifies under sign_pub
+}
+
+// ---- RNG operations (the confidential application layer) -------------------
+
+message RngOp {
+  oneof op {
+    NextInt next_int = 1;
+    NextBytes next_bytes = 2;
+    CommitReveal commit_reveal = 3;
+  }
+}
+
+message NextInt {
+  int64 min = 1;
+  int64 max = 2;
+}
+
+message NextBytes {
+  uint32 count = 1;
+}
+
+// NOTE: the enclave is stateless, so commit and reveal cannot span two calls.
+// This single op blocks delay_seconds, then returns hash + seed + value
+// together; the client still verifies SHA256(seed) == hash and re-derives value.
+message CommitReveal {
+  int64 min = 1;
+  int64 max = 2;
+  uint32 delay_seconds = 3;
+}
+
+message RngResult {
+  oneof result {
+    IntResult int_result = 1;
+    BytesResult bytes_result = 2;
+    CommitRevealResult commit_reveal = 3;
+  }
+}
+
+message IntResult {
+  int64 value = 1;
+}
+
+message BytesResult {
+  bytes data = 1;
+}
+
+message CommitRevealResult {
+  bytes commit_hash = 1; // SHA256(seed)
+  bytes seed = 2;
+  int64 value = 3;
+}

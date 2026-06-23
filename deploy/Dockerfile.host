@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+#
+# Host-side image: proxy-service + game-service jars on a JRE.
+# Runs on the parent EC2 (NOT in the enclave).
+#   docker build -f deploy/Dockerfile.host -t rng-host:latest .
+#
+#   # proxy (vsock -> enclave, gRPC :50051):
+#   docker run -d --name rng-proxy --network host --device=/dev/vsock \
+#     -e ENCLAVE_CID=16 -e RNG_VSOCK_PORT=5005 -e PROXY_GRPC_PORT=50051 \
+#     rng-host:latest java -jar /proxy-service.jar
+#
+#   # game (interactive CLI):
+#   docker run -it --rm --network host \
+#     -e PROXY_HOST=localhost -e PROXY_PORT=50051 -e PCR0=<hex> -e PCR8=<hex> \
+#     rng-host:latest java --enable-native-access=ALL-UNNAMED -jar /game-service.jar
+
+FROM maven:3.9-eclipse-temurin-24 AS build
+WORKDIR /src
+COPY . .
+RUN mvn -q -B -pl proxy-service,game-service -am -DskipTests package
+
+FROM eclipse-temurin:24-jre
+COPY --from=build /src/proxy-service/target/proxy-service.jar /proxy-service.jar
+COPY --from=build /src/game-service/target/game-service.jar /game-service.jar
