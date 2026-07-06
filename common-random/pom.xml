@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.mario</groupId>
+        <artifactId>rng-nitro-based-service</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>common-random</artifactId>
+    <packaging>jar</packaging>
+
+    <!--
+      Strategy-backed RNG core (from vingame/mario nhb-common-random, internal package).
+      RandomManager extends java.util.Random and rotates between crypto strategies
+      (SecureRandom, HMAC-DRBG, SHA-256 counter, ChaCha20). No gRPC/DB/service layer —
+      just the entropy core, so the enclave keeps a minimal dependency surface.
+      NOTE: RandomManager is thread-confined; use one instance per thread.
+    -->
+    <dependencies>
+        <dependency>
+            <groupId>org.bouncycastle</groupId>
+            <artifactId>bcprov-jdk18on</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+    </dependencies>
+</project>

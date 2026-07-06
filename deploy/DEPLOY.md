@@ -4,7 +4,7 @@ Topology recap:
 ```
 game (anywhere) --gRPC/TCP:50051--> proxy (parent host) --vsock:5005--> rng-engine (enclave)
 ```
-Enclave = GraalVM native binary of `rng-service`. Proxy + game = fat jars on the host.
+Enclave = `rng-service` shaded jar on a JRE. Proxy + game = fat jars on the host.
 
 ---
 
@@ -92,10 +92,6 @@ absolute path: `/opt/java/openjdk/bin/java` (see `Dockerfile.enclave.jre`).
 - **Arch**: the EIF arch = the instance arch; the Docker build matches it automatically.
 - **vsock CID**: parent is always CID 3; give the enclave a fixed CID (16 here) and
   pass the same to the proxy via `ENCLAVE_CID`.
-- **native-image metadata**: generated at build time by the tracing agent
-  (`NativeWarmup`). If the engine hits a missing-reflection error at runtime, add the
-  class to `NativeWarmup` and rebuild, or drop a config under
-  `rng-service/src/main/resources/META-INF/native-image/`.
 - **PCR8 = 0…0** means the EIF is unsigned — fine for a first smoke test, but the
   game rejects all-zero PCR0 (debug enclaves) and you should pin a real signed PCR8
   for production.

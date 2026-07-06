@@ -29,28 +29,33 @@ public final class Hpke {
     /** X25519 public key / KEM encapsulation length. */
     public static final int ENC_LEN = 32;
 
-    private final HPKE hpke = new HPKE(
+    // BouncyCastle's HPKE keeps mutable internal state across seal/open and is NOT thread-safe —
+    // sharing one instance across threads corrupts under concurrency (ChaCha20Poly1305 MAC
+    // failures, ArrayIndexOutOfBounds). One instance per thread: no cross-thread state, no
+    // per-call allocation. The suite config is constant, so per-thread instances are equivalent.
+    private static final ThreadLocal<HPKE> HPKE_TL = ThreadLocal.withInitial(() -> new HPKE(
             HPKE.mode_base,
             HPKE.kem_X25519_SHA256,
             HPKE.kdf_HKDF_SHA256,
-            HPKE.aead_CHACHA20_POLY1305);
+            HPKE.aead_CHACHA20_POLY1305));
 
     /** Fresh X25519 keypair for the KEM (enclave enc key, or game ephemeral). */
     public AsymmetricCipherKeyPair generateKeyPair() {
-        return hpke.generatePrivateKey();
+        return HPKE_TL.get().generatePrivateKey();
     }
 
     /** Raw 32-byte X25519 public key (goes into the attestation doc / request). */
     public byte[] serializePublic(AsymmetricCipherKeyPair kp) {
-        return hpke.serializePublicKey(kp.getPublic());
+        return HPKE_TL.get().serializePublicKey(kp.getPublic());
     }
 
     public AsymmetricKeyParameter deserializePublic(byte[] raw) {
-        return hpke.deserializePublicKey(raw);
+        return HPKE_TL.get().deserializePublicKey(raw);
     }
 
     /** Seal {@code pt} to recipient public key. Returns enc||ciphertext. */
     public byte[] seal(byte[] recipientPublic, byte[] pt) throws Exception {
+        HPKE hpke = HPKE_TL.get();
         AsymmetricKeyParameter pkR = hpke.deserializePublicKey(recipientPublic);
         byte[][] ctAndEnc = hpke.seal(pkR, INFO, NO_AAD, pt, NO_PSK, NO_PSK_ID, null); // {ct, enc}
         byte[] ct = ctAndEnc[0];
@@ -65,6 +70,6 @@ public final class Hpke {
     public byte[] open(byte[] wire, AsymmetricCipherKeyPair recipient) throws Exception {
         byte[] enc = Arrays.copyOfRange(wire, 0, ENC_LEN);
         byte[] ct = Arrays.copyOfRange(wire, ENC_LEN, wire.length);
-        return hpke.open(enc, recipient, INFO, NO_AAD, ct, NO_PSK, NO_PSK_ID, null);
+        return HPKE_TL.get().open(enc, recipient, INFO, NO_AAD, ct, NO_PSK, NO_PSK_ID, null);
     }
 }

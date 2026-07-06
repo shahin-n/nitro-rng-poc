@@ -6,7 +6,7 @@ set -euo pipefail
 
 IMAGE="${IMAGE:-rng-engine:latest}"
 EIF_OUT="${EIF_OUT:-rng.eif}"
-# JRE image by default (robust). Set DOCKERFILE=deploy/Dockerfile.enclave for native.
+# Enclave runs rng-service as a shaded jar on a JRE.
 DOCKERFILE="${DOCKERFILE:-deploy/Dockerfile.enclave.jre}"
 
 echo ">> docker build $IMAGE ($DOCKERFILE)"

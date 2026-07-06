@@ -23,7 +23,7 @@ compromised proxy can delay traffic but can never read, forge, or replay it.
 | `proto` | transport (`Attest`, opaque `Serve`) + app payload (`app.proto`, encrypted-only) | — | protobuf, grpc |
 | `common-crypto` | HPKE (X25519/HKDF-SHA256/ChaCha20-Poly1305) + ECDSA-P384/SHA-384 | trusted ends | BouncyCastle |
 | `attestation` | COSE_Sign1 verify, cert chain → pinned Nitro root, PCR0/PCR8 assert | game side | BC, CBOR |
-| `rng-service` | **RNG Engine** — boot keys, NSM `/dev/nsm`, HPKE serve | enclave | crypto, junixsocket-vsock, JNA, CBOR |
+| `rng-service` | **RNG Engine** — boot keys, NSM `/dev/nsm`, HPKE serve | enclave | crypto, junixsocket-vsock, FFM, CBOR |
 | `proxy-service` | **RNG Proxy** — pure ciphertext relay (no crypto dep by design) | untrusted | grpc, junixsocket-vsock |
 | `game-service` | **Game** — CLI: attest → verify → HPKE call | trusted | crypto, attestation, grpc |
 
@@ -52,12 +52,16 @@ Game  : decrypt -> verify signature under sign_pub -> check req_nonce
 
 Primitives: **HPKE base mode** DHKEM(X25519,HKDF-SHA256)/HKDF-SHA256/ChaCha20-Poly1305;
 **ECDSA P-384 / SHA-384**. The RNG ops (`NextInt`, `NextBytes`, `CommitReveal`)
-live in `app.proto` — confidential, never visible to the proxy.
+live in `app.proto` — confidential, never visible to the proxy. `CommitReveal` is
+served over a stream: the enclave pushes the signed commit hash, holds the
+connection `delay_seconds` (its own clock), then pushes the signed seed+value.
 
 ### Wire details
 
-- `game ↔ proxy`: gRPC `Attest` + `Serve` (both unary).
-- `proxy ↔ engine`: vsock, 1 tag byte (`A`/`S`) + length-delimited protobuf. The
+- `game ↔ proxy`: gRPC `Attest`, unary `Serve` (NextInt/NextBytes), and
+  server-streaming `ServeStream` (commit-reveal: enclave pushes commit frame, holds,
+  then pushes reveal frame).
+- `proxy ↔ engine`: vsock, 1 tag byte (`A`/`S`/`C`) + length-delimited protobuf. The
   proxy forwards bytes; it has no crypto/attestation/RNG dependency at all.
 - HPKE wire = `enc(32B X25519) || aead_ct` packed into `SealedMessage.ciphertext`.
 
@@ -115,12 +119,15 @@ verified before display.
 - Verification follows the spec checklist: COSE sig before reading fields; chain +
   expiry; PCR0/PCR8 assert; reject all-zero PCRs (debug enclaves); one-time nonce
   with constant-time compare; req_nonce anti-replay; signature over result.
-- **NSM ioctl** (`NsmClient`): real `/dev/nsm` `_IOWR(0x0A,0,nsm_message)` via JNA.
-  The ioctl constant + struct layout are validated on a live Nitro instance only —
-  exercise there before relying on it.
+- **NSM ioctl** (`NsmClient`): real `/dev/nsm` `_IOWR(0x0A,0,nsm_message)` via the JDK
+  FFM API (`java.lang.foreign`; needs `--enable-native-access=ALL-UNNAMED`). The ioctl
+  constant + struct layout are validated on a live Nitro instance only — exercise there
+  before relying on it.
 - HPKE + ECDSA round-trip is locally verified (seal/open, sign/verify, tamper-reject).
-- `CommitReveal` is single-response (enclave is stateless): hash+seed+value returned
-  together after the delay; client still verifies `SHA256(seed)==hash` and re-derives.
+- `CommitReveal` is an enclave-pushed stream (`ServeStream`): the enclave sends the
+  signed commit hash, holds the connection `delay_seconds` on its own clock, then pushes
+  the signed seed+value. No session state; client verifies `SHA256(seed)==hash` and
+  re-derives value.
 - Maven: corp Artifactory (`artifactory.withmario.com`) 401s some classified
   artifacts; they fall back to Maven Central (`protoc-gen-grpc-java` was installed
   from central once).

@@ -45,6 +45,11 @@
             <groupId>com.kohlschutter.junixsocket</groupId>
             <artifactId>junixsocket-vsock</artifactId>
         </dependency>
+        <!-- read the PUBLIC module_id out of the attestation doc for routing only -->
+        <dependency>
+            <groupId>com.upokecenter</groupId>
+            <artifactId>cbor</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>

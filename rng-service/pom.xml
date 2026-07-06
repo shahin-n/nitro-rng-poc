@@ -28,6 +28,10 @@
             <artifactId>common-crypto</artifactId>
         </dependency>
         <dependency>
+            <groupId>com.mario</groupId>
+            <artifactId>common-random</artifactId>
+        </dependency>
+        <dependency>
             <groupId>org.bouncycastle</groupId>
             <artifactId>bcprov-jdk18on</artifactId>
         </dependency>
@@ -67,7 +71,7 @@
                     <mainClass>com.mario.rng.RngServer</mainClass>
                 </configuration>
             </plugin>
-            <!-- runnable uber-jar: input to GraalVM native-image -->
+            <!-- runnable shaded uber-jar (the enclave EIF runs this on a JRE) -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>

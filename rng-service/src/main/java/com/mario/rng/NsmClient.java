@@ -18,8 +18,8 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
 /**
  * Nitro Secure Module client — requests a hardware-signed attestation document
- * over the {@code /dev/nsm} ioctl interface, using the JDK FFM API (no JNA, so it
- * builds cleanly into a GraalVM native image).
+ * over the {@code /dev/nsm} ioctl interface, using the JDK FFM API (java.lang.foreign,
+ * no JNA). Needs {@code --enable-native-access=ALL-UNNAMED} at runtime.
  *
  * <pre>
  *   request  = { "Attestation": { "user_data": bstr, "nonce": bstr, "public_key": bstr } }
