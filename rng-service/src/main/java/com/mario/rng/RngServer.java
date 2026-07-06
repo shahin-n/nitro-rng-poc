@@ -3,6 +3,7 @@ package com.mario.rng;
 import com.google.protobuf.ByteString;
 import com.mario.crypto.EcdsaSigner;
 import com.mario.crypto.Hpke;
+import com.mario.rng.app.AttestedResult;
 import com.mario.rng.app.RngOp;
 import com.mario.rng.app.RngResult;
 import com.mario.rng.app.SealedRequest;
@@ -40,6 +41,8 @@ public final class RngServer {
 
     static final int TAG_ATTEST = 'A';
     static final int TAG_SERVE = 'S';
+    static final int TAG_STREAM = 'C'; // commit-reveal: one request, two pushed frames
+    static final int TAG_STREAM_ATTESTED = 'D'; // commit-reveal, each frame NSM-attested
 
     private static final int CID_ANY = -1; // VMADDR_CID_ANY
 
@@ -87,6 +90,14 @@ public final class RngServer {
                 switch (tag) {
                     case TAG_ATTEST -> attest(in, out);
                     case TAG_SERVE -> serveOne(in, out);
+                    case TAG_STREAM -> {
+                        serveStream(in, out);   // pushes both frames itself, then we close the connection
+                        return;
+                    }
+                    case TAG_STREAM_ATTESTED -> {
+                        serveStreamAttested(in, out); // same, but each frame carries a fresh NSM doc
+                        return;
+                    }
                     default -> {
                         log.warn("unknown tag {} — closing", tag);
                         return;
@@ -113,19 +124,71 @@ public final class RngServer {
     }
 
     private void serveOne(InputStream in, OutputStream out) throws Exception {
-        SealedMessage msg = SealedMessage.parseDelimitedFrom(in);
+        SealedRequest sreq = openRequest(in);
+        RngResult result = engine.execute(RngOp.parseFrom(sreq.getOp()));
+        sealFrame(result, sreq).writeDelimitedTo(out);
+    }
 
-        // 1) HPKE open with the enclave enc key
-        byte[] plain = hpke.open(msg.getCiphertext().toByteArray(), encKeyPair);
-        SealedRequest sreq = SealedRequest.parseFrom(plain);
-
-        // 2) run RNG
+    /**
+     * Commit-reveal over a held connection: push the signed commit-hash frame and flush,
+     * sleep the delay on the enclave's own clock, then push the signed reveal frame. The
+     * caller closes the connection afterwards so the proxy sees end-of-stream.
+     */
+    private void serveStream(InputStream in, OutputStream out) throws Exception {
+        SealedRequest sreq = openRequest(in);
         RngOp op = RngOp.parseFrom(sreq.getOp());
-        RngResult result = engine.execute(op);
+        if (op.getOpCase() != RngOp.OpCase.COMMIT_REVEAL) {
+            throw new IllegalArgumentException("ServeStream serves commit_reveal only, got " + op.getOpCase());
+        }
+        RngEngine.CommitRevealFrames frames = engine.commitReveal(op.getCommitReveal());
+
+        // frame 1 — commit hash; flushed now, so the enclave is bound before the seed exists to the game
+        sealFrame(RngResult.newBuilder().setCommit(frames.commit()).build(), sreq).writeDelimitedTo(out);
+        out.flush();
+
+        // hold the stream for the delay (enclave clock), then push the reveal
+        sleepSeconds(frames.commit().getDelaySeconds());
+        sealFrame(RngResult.newBuilder().setReveal(frames.reveal()).build(), sreq).writeDelimitedTo(out);
+        out.flush();
+    }
+
+    /**
+     * Commit-reveal, per-response attested. Same two-frame flow as {@link #serveStream}, but each
+     * frame is sealed with a FRESH NSM attestation document (see {@link #sealAttestedFrame}) rather
+     * than the ephemeral ECDSA signature — so every pushed response independently proves it came
+     * from the genuine enclave (PCRs + Nitro cert chain), not just from a once-attested key. One
+     * NsmClient is held open for the whole stream (two attest ioctls).
+     */
+    private void serveStreamAttested(InputStream in, OutputStream out) throws Exception {
+        SealedRequest sreq = openRequest(in);
+        RngOp op = RngOp.parseFrom(sreq.getOp());
+        if (op.getOpCase() != RngOp.OpCase.COMMIT_REVEAL) {
+            throw new IllegalArgumentException("ServeStreamAttested serves commit_reveal only, got " + op.getOpCase());
+        }
+        RngEngine.CommitRevealFrames frames = engine.commitReveal(op.getCommitReveal());
+
+        try (NsmClient nsm = new NsmClient()) {
+            // frame 1 — commit hash, attested + flushed now (enclave bound before the seed hits the wire)
+            sealAttestedFrame(RngResult.newBuilder().setCommit(frames.commit()).build(), sreq, nsm).writeDelimitedTo(out);
+            out.flush();
+
+            // hold the stream for the delay (enclave clock), then push the attested reveal
+            sleepSeconds(frames.commit().getDelaySeconds());
+            sealAttestedFrame(RngResult.newBuilder().setReveal(frames.reveal()).build(), sreq, nsm).writeDelimitedTo(out);
+            out.flush();
+        }
+    }
+
+    /** Read one delimited SealedMessage and HPKE-open it to the inner SealedRequest. */
+    private SealedRequest openRequest(InputStream in) throws Exception {
+        SealedMessage msg = SealedMessage.parseDelimitedFrom(in);
+        return SealedRequest.parseFrom(hpke.open(msg.getCiphertext().toByteArray(), encKeyPair));
+    }
+
+    /** Sign (result || req_nonce) and HPKE-seal the SignedResult to the game's ephemeral pub. */
+    private SealedMessage sealFrame(RngResult result, SealedRequest sreq) throws Exception {
         byte[] resultBytes = result.toByteArray();
         byte[] reqNonce = sreq.getReqNonce().toByteArray();
-
-        // 3) sign (result || req_nonce) with sign_priv
         byte[] signature = EcdsaSigner.sign(signKeyPair.getPrivate(), concat(resultBytes, reqNonce));
         byte[] signed = SignedResult.newBuilder()
                 .setResult(ByteString.copyFrom(resultBytes))
@@ -133,13 +196,36 @@ public final class RngServer {
                 .setSignature(ByteString.copyFrom(signature))
                 .build()
                 .toByteArray();
-
-        // 4) HPKE seal to the game's ephemeral pub
         byte[] sealed = hpke.seal(sreq.getGamePub().toByteArray(), signed);
-        SealedMessage.newBuilder()
-                .setCiphertext(ByteString.copyFrom(sealed))
+        return SealedMessage.newBuilder().setCiphertext(ByteString.copyFrom(sealed)).build();
+    }
+
+    /**
+     * Attest one result and HPKE-seal it to the game. The NSM doc binds user_data = SHA256(result)
+     * and nonce = req_nonce; public_key = encPub (matches the session attestation). The game runs
+     * the full attestation verify on this doc, so the frame is trusted on hardware evidence alone.
+     */
+    private SealedMessage sealAttestedFrame(RngResult result, SealedRequest sreq, NsmClient nsm) throws Exception {
+        byte[] resultBytes = result.toByteArray();
+        byte[] reqNonce = sreq.getReqNonce().toByteArray();
+        byte[] userData = RngEngine.sha256(resultBytes); // binds the exact result into the signed doc
+        byte[] doc = nsm.attest(userData, reqNonce, encPub);
+        byte[] attested = AttestedResult.newBuilder()
+                .setResult(ByteString.copyFrom(resultBytes))
+                .setReqNonce(ByteString.copyFrom(reqNonce))
+                .setAttestationDoc(ByteString.copyFrom(doc))
                 .build()
-                .writeDelimitedTo(out);
+                .toByteArray();
+        byte[] sealed = hpke.seal(sreq.getGamePub().toByteArray(), attested);
+        return SealedMessage.newBuilder().setCiphertext(ByteString.copyFrom(sealed)).build();
+    }
+
+    private static void sleepSeconds(int seconds) {
+        try {
+            Thread.sleep(seconds * 1000L);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static byte[] concat(byte[] a, byte[] b) {

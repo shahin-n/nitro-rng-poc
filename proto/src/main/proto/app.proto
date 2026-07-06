@@ -29,6 +29,17 @@ message SignedResult {
   bytes signature = 3;  // ECDSA-P384/SHA-384 over (result || req_nonce), verifies under sign_pub
 }
 
+// Enclave reply for ServeStreamAttested: instead of an ECDSA signature, the
+// whole struct carries a fresh NSM attestation document, then is HPKE-sealed to
+// game_pub. The doc's user_data = SHA256(result) and its nonce = req_nonce, so
+// verifying the doc (PCRs + Nitro cert chain + nonce) proves THIS response came
+// from the genuine enclave. Opaque inside HPKE — the proxy can't strip or swap it.
+message AttestedResult {
+  bytes result = 1;          // serialized RngResult
+  bytes req_nonce = 2;       // must equal the request's req_nonce (== doc nonce)
+  bytes attestation_doc = 3; // COSE_Sign1; user_data = SHA256(result), nonce = req_nonce
+}
+
 // ---- RNG operations (the confidential application layer) -------------------
 
 message RngOp {
@@ -48,20 +59,31 @@ message NextBytes {
   uint32 count = 1;
 }
 
-// NOTE: the enclave is stateless, so commit and reveal cannot span two calls.
-// This single op blocks delay_seconds, then returns hash + seed + value
-// together; the client still verifies SHA256(seed) == hash and re-derives value.
+// ---- Provably-fair commit / reveal (enclave-pushed stream) -----------------
+// True commit-reveal over ONE held connection (RngService.ServeStream). The
+// enclave generates a seed, then pushes TWO signed, HPKE-sealed frames on the
+// same stream:
+//
+//   frame 1 -> CommitResult{ commit_hash }      (sent + flushed immediately)
+//   (enclave sleeps delay_seconds, on its own clock — host can't shortcut it)
+//   frame 2 -> RevealResult{ seed, value }
+//
+// The hash is on the wire (and signed) before the seed exists to the client, so
+// the enclave is bound. No session map, no second call, no client-side clock
+// math. The client checks SHA256(seed) == commit_hash and re-derives value.
+
 message CommitReveal {
   int64 min = 1;
   int64 max = 2;
-  uint32 delay_seconds = 3;
+  uint32 delay_seconds = 3; // enclave holds the stream this long between frames
 }
 
 message RngResult {
   oneof result {
     IntResult int_result = 1;
     BytesResult bytes_result = 2;
-    CommitRevealResult commit_reveal = 3;
+    CommitResult commit = 3;   // stream frame 1
+    RevealResult reveal = 4;   // stream frame 2
   }
 }
 
@@ -73,8 +95,12 @@ message BytesResult {
   bytes data = 1;
 }
 
-message CommitRevealResult {
-  bytes commit_hash = 1; // SHA256(seed)
-  bytes seed = 2;
-  int64 value = 3;
+message CommitResult {
+  bytes commit_hash = 1;     // SHA256(seed) — bound before the seed is revealed
+  uint32 delay_seconds = 2;  // echo: how long until the reveal frame arrives
+}
+
+message RevealResult {
+  bytes seed = 1;
+  int64 value = 2;
 }
