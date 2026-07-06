@@ -25,6 +25,20 @@ service RngService {
   // Step C — Serve. Opaque HPKE ciphertext both ways (sign-then-encrypt).
   // The proxy relays bytes; only the enclave/game can read them.
   rpc Serve (SealedMessage) returns (SealedMessage);
+
+  // Step C (streaming) — one request, MANY opaque replies pushed by the enclave
+  // over a held connection. Used by commit-reveal: the enclave pushes the sealed
+  // commit-hash frame, holds the stream for the delay, then pushes the sealed
+  // reveal frame. Still pure ciphertext relay; the proxy just forwards each frame.
+  rpc ServeStream (SealedMessage) returns (stream SealedMessage);
+
+  // Step C (streaming, per-response attested) — same commit-reveal stream as
+  // ServeStream, but EACH pushed frame carries a FRESH NSM attestation document
+  // instead of the ephemeral ECDSA signature. The doc binds SHA256(result) in
+  // user_data and req_nonce in its nonce, so every response independently proves
+  // it came from the genuine enclave (PCRs + Nitro cert chain), not merely from a
+  // key attested once earlier. Still opaque HPKE ciphertext relay to the proxy.
+  rpc ServeStreamAttested (SealedMessage) returns (stream SealedMessage);
 }
 
 message AttestRequest {
@@ -36,5 +50,9 @@ message AttestReply {
 }
 
 message SealedMessage {
-  bytes ciphertext = 1; // HPKE: enc(KEM) || AEAD ciphertext+tag — opaque to proxy
+  bytes ciphertext = 1;  // HPKE: enc(KEM) || AEAD ciphertext+tag — opaque to proxy
+  // Public routing tag: the enclave's module_id from attestation. Proxy maps
+  // module_id -> enclave CID so a Serve lands on the enclave that attested the
+  // session. Not secret (it's the enclave instance id); empty until attested.
+  string module_id = 2;
 }
