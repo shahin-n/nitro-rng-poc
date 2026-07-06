@@ -39,6 +39,29 @@ service RngService {
   // it came from the genuine enclave (PCRs + Nitro cert chain), not merely from a
   // key attested once earlier. Still opaque HPKE ciphertext relay to the proxy.
   rpc ServeStreamAttested (SealedMessage) returns (stream SealedMessage);
+
+  // Step A — Allowed-PCR discovery. Returns the release-signed PCR manifest so a
+  // client learns which PCR0/PCR8 measurements it must accept WITHOUT baking the
+  // set in or trusting the proxy. The proxy loads the manifest+signature from disk
+  // and relays them VERBATIM; it does not (and cannot) forge them. Trust comes from
+  // the signature, verified by the client under a pinned release public key — the
+  // transport is untrusted. Rotating the allowed set = re-signing + redeploying the
+  // two files behind the proxy, with no client change (zero-downtime, many clients).
+  rpc GetPcrManifest (ManifestRequest) returns (PcrManifest);
+}
+
+message ManifestRequest {}
+
+// Release-signed allow-list of enclave measurements. `manifest_json` is the exact
+// canonical bytes that were signed; the client verifies `signature` over THOSE
+// bytes (as received, no re-serialization) under its pinned release public key,
+// then parses the JSON. Schema of manifest_json:
+//   { "service":"rng-service", "version":<int>,
+//     "allowed_pcr0":["<hex48>",...], "allowed_pcr8":["<hex48>",...],
+//     "not_after":"<RFC3339>" }
+message PcrManifest {
+  bytes manifest_json = 1; // canonical JSON, exactly the bytes that were signed
+  bytes signature = 2;     // ECDSA-P384/SHA-384 (DER) over manifest_json, under release key
 }
 
 message AttestRequest {

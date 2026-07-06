@@ -1,7 +1,10 @@
 package com.mario.proxy;
 
+import com.google.protobuf.ByteString;
 import com.mario.rng.proto.AttestReply;
 import com.mario.rng.proto.AttestRequest;
+import com.mario.rng.proto.ManifestRequest;
+import com.mario.rng.proto.PcrManifest;
 import com.mario.rng.proto.RngServiceGrpc;
 import com.mario.rng.proto.SealedMessage;
 import io.grpc.Status;
@@ -35,9 +38,24 @@ final class RngProxyService extends RngServiceGrpc.RngServiceImplBase {
     private final int enclaveCid;
     private final ConcurrentMap<String, Integer> moduleToCid = new ConcurrentHashMap<>();
 
-    RngProxyService(VsockRngClient enclave, int enclaveCid) {
+    // Release-signed PCR manifest + detached signature, loaded from disk and relayed
+    // VERBATIM. The proxy is untrusted for these — the client verifies the signature
+    // under a pinned release key. Volatile + swapped together so a file-watch reload
+    // (rotation) takes effect with no restart; null when not configured.
+    private volatile ByteString manifestJson;
+    private volatile ByteString manifestSig;
+
+    RngProxyService(VsockRngClient enclave, int enclaveCid, byte[] manifestJson, byte[] manifestSig) {
         this.enclave = enclave;
         this.enclaveCid = enclaveCid;
+        this.manifestJson = manifestJson == null ? null : ByteString.copyFrom(manifestJson);
+        this.manifestSig = manifestSig == null ? null : ByteString.copyFrom(manifestSig);
+    }
+
+    /** Swap in a freshly-read manifest+signature (called by the file watcher). */
+    void reloadManifest(byte[] json, byte[] sig) {
+        this.manifestJson = ByteString.copyFrom(json);
+        this.manifestSig = ByteString.copyFrom(sig);
     }
 
     @Override
@@ -97,6 +115,25 @@ final class RngProxyService extends RngServiceGrpc.RngServiceImplBase {
         } catch (IOException e) {
             fail(responseObserver, e);
         }
+    }
+
+    @Override
+    public void getPcrManifest(ManifestRequest request, StreamObserver<PcrManifest> responseObserver) {
+        ByteString json = manifestJson;  // one snapshot: never mix json from one
+        ByteString sig = manifestSig;     // reload with sig from another
+        if (json == null || sig == null) {
+            responseObserver.onError(Status.UNIMPLEMENTED
+                    .withDescription("no PCR manifest configured on this proxy")
+                    .asRuntimeException());
+            return;
+        }
+        // Verbatim relay — proxy does not verify (can't; that's the client's job under
+        // the pinned release key). Trust is in the signature, not this transport.
+        responseObserver.onNext(PcrManifest.newBuilder()
+                .setManifestJson(json)
+                .setSignature(sig)
+                .build());
+        responseObserver.onCompleted();
     }
 
     /** Resolve the session's module_id to its attested CID, or fail the call and return null. */

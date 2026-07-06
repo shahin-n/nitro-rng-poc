@@ -2,17 +2,23 @@ package com.mario.game;
 
 import com.mario.attestation.AttestationVerifier;
 import com.mario.attestation.NitroPins;
+import com.mario.attestation.PcrPolicy;
+import com.mario.attestation.ReleaseKey;
 import com.mario.rng.app.CommitReveal;
 import com.mario.rng.app.NextBytes;
 import com.mario.rng.app.NextInt;
 import com.mario.rng.app.RngOp;
 import com.mario.rng.app.RngResult;
+import com.mario.rng.proto.ManifestRequest;
 import com.mario.rng.proto.RngServiceGrpc;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.PublicKey;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.Scanner;
@@ -24,30 +30,37 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 /**
- * game-service — interactive CLI. Pins PCR0/PCR8 from env (release manifest),
- * attests the enclave, then runs encrypted+signed RNG ops through the proxy.
+ * game-service — interactive CLI. Learns the allowed enclave measurements from
+ * the release-signed PCR manifest (fetched via the proxy, verified under a pinned
+ * release key), attests the enclave, then runs encrypted+signed RNG ops.
  *
- * <p>Env: {@code PROXY_HOST} (localhost), {@code PROXY_PORT} (50051),
- * {@code PCR0} + {@code PCR8} (96-hex-char SHA-384 measurements, required).
+ * <p>Env: {@code PROXY_HOST} (localhost), {@code PROXY_PORT} (50051).
+ * <p>Manifest trust: {@code RELEASE_PUBKEY_PATH} (optional PEM override; default is
+ * the pinned {@code release-pub.pem} bundled in the attestation module).
+ * <p>Dev override: set {@code PCR0} + {@code PCR8} (96-hex SHA-384) to pin a single
+ * measurement from env and skip the manifest entirely.
  */
 public final class GameClient {
 
     private static final HexFormat HEX = HexFormat.of();
+    private static final String SERVICE = "rng-service";
 
-    public static void main(String[] args) throws InterruptedException {
+    public static void main(String[] args) throws Exception {
         String host = System.getenv().getOrDefault("PROXY_HOST", "localhost");
         int port = Integer.parseInt(System.getenv().getOrDefault("PROXY_PORT", "50051"));
 
-        NitroPins pins = readPins();
-        if (pins == null) {
-            System.out.println("Set PCR0 and PCR8 (hex, from the release manifest) to attest. Aborting.");
-            return;
-        }
-        AttestationVerifier verifier = new AttestationVerifier(pins);
-
         ManagedChannel channel = ManagedChannelBuilder.forAddress(host, port).usePlaintext().build();
         RngServiceGrpc.RngServiceBlockingStub stub = RngServiceGrpc.newBlockingStub(channel);
+
+        PcrPolicy policy = loadPolicy(stub);
+        AttestationVerifier verifier = new AttestationVerifier(policy);
         EnclaveSession session = new EnclaveSession(stub, verifier);
+
+        // When trusting a signed manifest, poll for a newer one so a running client
+        // adopts a rotation (new allowed PCR set) without a restart.
+        if (policy instanceof com.mario.attestation.PcrManifest pm) {
+            startManifestPoller(stub, verifier, pm.version());
+        }
         Scanner in = new Scanner(System.in);
 
         System.out.printf("game-service CLI -> proxy %s:%d%n", host, port);
@@ -233,13 +246,83 @@ public final class GameClient {
 
     // ---- helpers -------------------------------------------------------------
 
-    private static NitroPins readPins() {
+    /**
+     * The allowed-measurement policy. Production: fetch the release-signed manifest
+     * via the proxy and verify it under the pinned release key. Dev: if {@code PCR0}
+     * and {@code PCR8} are set, pin those directly and skip the manifest.
+     */
+    private static PcrPolicy loadPolicy(RngServiceGrpc.RngServiceBlockingStub stub) throws Exception {
         String p0 = System.getenv("PCR0");
         String p8 = System.getenv("PCR8");
-        if (p0 == null || p8 == null) {
-            return null;
+        if (p0 != null && p8 != null) {
+            System.out.println("  [dev] pinning PCR0/PCR8 from env, skipping signed manifest");
+            return NitroPins.ofHex(p0.trim(), p8.trim());
         }
-        return NitroPins.ofHex(p0.trim(), p8.trim());
+
+        com.mario.attestation.PcrManifest manifest = fetchManifest(stub, loadReleaseKey());
+        System.out.printf("  allowed PCRs from signed manifest v%d (expires %s)%n",
+                manifest.version(), manifest.notAfter());
+        return manifest;
+    }
+
+    /** Fetch + verify the signed manifest under the pinned release key. */
+    private static com.mario.attestation.PcrManifest fetchManifest(
+            RngServiceGrpc.RngServiceBlockingStub stub, PublicKey releaseKey) throws Exception {
+        com.mario.rng.proto.PcrManifest resp = stub.getPcrManifest(ManifestRequest.newBuilder().build());
+        return com.mario.attestation.PcrManifest.verify(
+                resp.getManifestJson().toByteArray(),
+                resp.getSignature().toByteArray(),
+                releaseKey, SERVICE);
+    }
+
+    /**
+     * Background poll: every {@code MANIFEST_POLL_SECONDS} (default 30, 0 disables),
+     * re-fetch + verify the manifest and adopt it if its version is higher. Version is
+     * monotonic, so a stale or replayed older manifest is ignored. Verification failures
+     * are transient-tolerated — the current policy stays in force.
+     */
+    private static void startManifestPoller(RngServiceGrpc.RngServiceBlockingStub stub,
+                                            AttestationVerifier verifier, int initialVersion) {
+        int period = Integer.parseInt(System.getenv().getOrDefault("MANIFEST_POLL_SECONDS", "30"));
+        if (period <= 0) {
+            return;
+        }
+        PublicKey releaseKey;
+        try {
+            releaseKey = loadReleaseKey();
+        } catch (Exception e) {
+            System.out.println("  manifest poll disabled: " + e.getMessage());
+            return;
+        }
+        AtomicInteger ver = new AtomicInteger(initialVersion);
+        Thread t = new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(period * 1000L);
+                    com.mario.attestation.PcrManifest m = fetchManifest(stub, releaseKey);
+                    if (m.version() > ver.get()) {
+                        verifier.updatePolicy(m);
+                        ver.set(m.version());
+                        System.out.printf("  [manifest] adopted v%d (expires %s)%n", m.version(), m.notAfter());
+                    }
+                } catch (InterruptedException ie) {
+                    return;
+                } catch (Exception e) {
+                    // transient (proxy blip, mid-rotation file swap) — keep the current policy
+                }
+            }
+        }, "manifest-poller");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Pinned release public key: env-pointed PEM override, else the bundled default. */
+    private static PublicKey loadReleaseKey() throws Exception {
+        String path = System.getenv("RELEASE_PUBKEY_PATH");
+        if (path != null && !path.isBlank()) {
+            return ReleaseKey.fromPem(Files.readAllBytes(Path.of(path)));
+        }
+        return ReleaseKey.loadPinned();
     }
 
     private static long askLong(Scanner in, String label, long def) {
