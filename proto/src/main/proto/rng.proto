@@ -40,6 +40,13 @@ service RngService {
   // key attested once earlier. Still opaque HPKE ciphertext relay to the proxy.
   rpc ServeStreamAttested (SealedMessage) returns (stream SealedMessage);
 
+  // Step C (unary, per-response attested) — one opaque request, ONE opaque reply
+  // carrying a fresh NSM attestation document that binds SHA256(request || result).
+  // Backs the Attested Provably-Fair Round standard (RoundOpen / RoundAction /
+  // RoundSettle in app.proto): each round step is one self-verifiable attested call.
+  // Still pure ciphertext relay; the proxy routes by module_id like Serve.
+  rpc ServeAttested (SealedMessage) returns (SealedMessage);
+
   // Step A — Allowed-PCR discovery. Returns the release-signed PCR manifest so a
   // client learns which PCR0/PCR8 measurements it must accept WITHOUT baking the
   // set in or trusting the proxy. The proxy loads the manifest+signature from disk

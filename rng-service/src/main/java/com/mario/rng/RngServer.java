@@ -8,6 +8,7 @@ import com.mario.rng.app.RngOp;
 import com.mario.rng.app.RngResult;
 import com.mario.rng.app.SealedRequest;
 import com.mario.rng.app.SignedResult;
+import com.mario.rng.round.RoundService;
 import com.mario.rng.proto.AttestReply;
 import com.mario.rng.proto.AttestRequest;
 import com.mario.rng.proto.SealedMessage;
@@ -43,11 +44,13 @@ public final class RngServer {
     static final int TAG_SERVE = 'S';
     static final int TAG_STREAM = 'C'; // commit-reveal: one request, two pushed frames
     static final int TAG_STREAM_ATTESTED = 'D'; // commit-reveal, each frame NSM-attested
+    static final int TAG_SERVE_ATTESTED = 'E'; // APFR round op: one request, one NSM-attested reply
 
     private static final int CID_ANY = -1; // VMADDR_CID_ANY
 
     private final int port;
     private final RngEngine engine = new RngEngine();
+    private final RoundService rounds = new RoundService();
     private final Hpke hpke = new Hpke();
     private final ExecutorService workers = Executors.newCachedThreadPool();
 
@@ -98,6 +101,7 @@ public final class RngServer {
                         serveStreamAttested(in, out); // same, but each frame carries a fresh NSM doc
                         return;
                     }
+                    case TAG_SERVE_ATTESTED -> serveAttested(in, out); // APFR round op, one attested reply
                     default -> {
                         log.warn("unknown tag {} — closing", tag);
                         return;
@@ -162,20 +166,46 @@ public final class RngServer {
     private void serveStreamAttested(InputStream in, OutputStream out) throws Exception {
         SealedRequest sreq = openRequest(in);
         RngOp op = RngOp.parseFrom(sreq.getOp());
-        if (op.getOpCase() != RngOp.OpCase.COMMIT_REVEAL) {
-            throw new IllegalArgumentException("ServeStreamAttested serves commit_reveal only, got " + op.getOpCase());
+        switch (op.getOpCase()) {
+            case COMMIT_REVEAL -> {
+                RngEngine.CommitRevealFrames frames = engine.commitReveal(op.getCommitReveal());
+                try (NsmClient nsm = new NsmClient()) {
+                    // frame 1 — commit hash, attested + flushed now (enclave bound before the seed hits the wire)
+                    sealAttestedFrame(RngResult.newBuilder().setCommit(frames.commit()).build(), sreq, nsm).writeDelimitedTo(out);
+                    out.flush();
+                    // hold the stream for the delay (enclave clock), then push the attested reveal
+                    sleepSeconds(frames.commit().getDelaySeconds());
+                    sealAttestedFrame(RngResult.newBuilder().setReveal(frames.reveal()).build(), sreq, nsm).writeDelimitedTo(out);
+                    out.flush();
+                }
+            }
+            case NOISE_COMMIT_REVEAL -> {
+                RngEngine.NoiseFrames frames = engine.noiseCommitReveal(op.getNoiseCommitReveal());
+                try (NsmClient nsm = new NsmClient()) {
+                    // frame 1 — commit hash of the noise payload, attested + flushed before the payload is revealed
+                    sealAttestedFrame(RngResult.newBuilder().setNoiseCommit(frames.commit()).build(), sreq, nsm).writeDelimitedTo(out);
+                    out.flush();
+                    sleepSeconds(frames.commit().getDelaySeconds());
+                    sealAttestedFrame(RngResult.newBuilder().setNoiseReveal(frames.reveal()).build(), sreq, nsm).writeDelimitedTo(out);
+                    out.flush();
+                }
+            }
+            default -> throw new IllegalArgumentException(
+                    "ServeStreamAttested serves commit_reveal / noise_commit_reveal only, got " + op.getOpCase());
         }
-        RngEngine.CommitRevealFrames frames = engine.commitReveal(op.getCommitReveal());
+    }
 
+    /**
+     * APFR round op (RoundOpen / RoundAction / RoundSettle) — one request, one NSM-attested reply.
+     * The round state lives in {@link RoundService} across calls; the reply is sealed with a fresh
+     * doc that binds SHA256(request || result), so every round step is independently verifiable.
+     */
+    private void serveAttested(InputStream in, OutputStream out) throws Exception {
+        SealedRequest sreq = openRequest(in);
+        RngOp op = RngOp.parseFrom(sreq.getOp());
+        RngResult result = rounds.handle(op, "", System.currentTimeMillis());
         try (NsmClient nsm = new NsmClient()) {
-            // frame 1 — commit hash, attested + flushed now (enclave bound before the seed hits the wire)
-            sealAttestedFrame(RngResult.newBuilder().setCommit(frames.commit()).build(), sreq, nsm).writeDelimitedTo(out);
-            out.flush();
-
-            // hold the stream for the delay (enclave clock), then push the attested reveal
-            sleepSeconds(frames.commit().getDelaySeconds());
-            sealAttestedFrame(RngResult.newBuilder().setReveal(frames.reveal()).build(), sreq, nsm).writeDelimitedTo(out);
-            out.flush();
+            sealAttestedFrame(result, sreq, nsm).writeDelimitedTo(out);
         }
     }
 
@@ -207,12 +237,16 @@ public final class RngServer {
      */
     private SealedMessage sealAttestedFrame(RngResult result, SealedRequest sreq, NsmClient nsm) throws Exception {
         byte[] resultBytes = result.toByteArray();
+        byte[] reqBytes = sreq.getOp().toByteArray();          // the exact RngOp the enclave processed
         byte[] reqNonce = sreq.getReqNonce().toByteArray();
-        byte[] userData = RngEngine.sha256(resultBytes); // binds the exact result into the signed doc
+        // Bind BOTH request and result into the signed doc: proves this enclave produced this
+        // result FOR this request, not just some result. The client re-derives the same digest.
+        byte[] userData = RngEngine.sha256(concat(reqBytes, resultBytes));
         byte[] doc = nsm.attest(userData, reqNonce, encPub);
         byte[] attested = AttestedResult.newBuilder()
                 .setResult(ByteString.copyFrom(resultBytes))
                 .setReqNonce(ByteString.copyFrom(reqNonce))
+                .setRequest(ByteString.copyFrom(reqBytes))
                 .setAttestationDoc(ByteString.copyFrom(doc))
                 .build()
                 .toByteArray();

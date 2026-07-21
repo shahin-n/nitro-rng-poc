@@ -33,6 +33,9 @@ import java.util.concurrent.ConcurrentMap;
 final class RngProxyService extends RngServiceGrpc.RngServiceImplBase {
 
     private static final Logger log = LoggerFactory.getLogger(RngProxyService.class);
+    // Dedicated audit trail. The proxy relays opaque HPKE ciphertext, so it can only attest to
+    // ENVELOPE metadata: which module_id/CID, method, ciphertext sizes, frame counts, latency.
+    private static final Logger audit = LoggerFactory.getLogger("audit");
 
     private final VsockRngClient enclave;
     private final int enclaveCid;
@@ -60,17 +63,23 @@ final class RngProxyService extends RngServiceGrpc.RngServiceImplBase {
 
     @Override
     public void attest(AttestRequest request, StreamObserver<AttestReply> responseObserver) {
+        long t0 = System.nanoTime();
         try {
             AttestReply reply = enclave.attest(enclaveCid, request);
             String moduleId = ModuleId.extract(reply.getAttestationDoc().toByteArray());
             moduleToCid.put(moduleId, enclaveCid);
             log.info("attested module_id={} -> cid={}", moduleId, enclaveCid);
+            audit.info("op=attest module_id={} cid={} nonce={}B doc={}B {}ms",
+                    moduleId, enclaveCid, request.getClientNonce().size(),
+                    reply.getAttestationDoc().size(), ms(t0));
             responseObserver.onNext(reply);
             responseObserver.onCompleted();
         } catch (IOException e) {
+            audit.warn("op=attest cid={} FAILED {}ms: {}", enclaveCid, ms(t0), e.getMessage());
             fail(responseObserver, e);
         } catch (RuntimeException e) {
             log.error("attest routing failed", e);
+            audit.warn("op=attest cid={} FAILED {}ms: {}", enclaveCid, ms(t0), e.getMessage());
             responseObserver.onError(Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
         }
     }
@@ -81,10 +90,36 @@ final class RngProxyService extends RngServiceGrpc.RngServiceImplBase {
         if (cid == null) {
             return;
         }
+        long t0 = System.nanoTime();
         try {
-            responseObserver.onNext(enclave.serve(cid, request));
+            SealedMessage reply = enclave.serve(cid, request);
+            audit.info("op=serve module_id={} cid={} req={}B reply={}B {}ms",
+                    request.getModuleId(), cid, request.getCiphertext().size(),
+                    reply.getCiphertext().size(), ms(t0));
+            responseObserver.onNext(reply);
             responseObserver.onCompleted();
         } catch (IOException e) {
+            audit.warn("op=serve module_id={} cid={} FAILED {}ms: {}", request.getModuleId(), cid, ms(t0), e.getMessage());
+            fail(responseObserver, e);
+        }
+    }
+
+    @Override
+    public void serveAttested(SealedMessage request, StreamObserver<SealedMessage> responseObserver) {
+        Integer cid = routeOrFail(request, responseObserver);
+        if (cid == null) {
+            return;
+        }
+        long t0 = System.nanoTime();
+        try {
+            SealedMessage reply = enclave.serveAttested(cid, request);
+            audit.info("op=serveAttested module_id={} cid={} req={}B reply={}B {}ms",
+                    request.getModuleId(), cid, request.getCiphertext().size(),
+                    reply.getCiphertext().size(), ms(t0));
+            responseObserver.onNext(reply);
+            responseObserver.onCompleted();
+        } catch (IOException e) {
+            audit.warn("op=serveAttested module_id={} cid={} FAILED {}ms: {}", request.getModuleId(), cid, ms(t0), e.getMessage());
             fail(responseObserver, e);
         }
     }
@@ -95,10 +130,16 @@ final class RngProxyService extends RngServiceGrpc.RngServiceImplBase {
         if (cid == null) {
             return;
         }
+        long t0 = System.nanoTime();
+        FrameMeter m = new FrameMeter();
         try {
-            enclave.serveStream(cid, request, responseObserver::onNext);
+            enclave.serveStream(cid, request, m.wrap(responseObserver));
+            audit.info("op=serveStream module_id={} cid={} req={}B frames={} replyBytes={} {}ms",
+                    request.getModuleId(), cid, request.getCiphertext().size(), m.frames, m.bytes, ms(t0));
             responseObserver.onCompleted();
         } catch (IOException e) {
+            audit.warn("op=serveStream module_id={} cid={} frames={} FAILED {}ms: {}",
+                    request.getModuleId(), cid, m.frames, ms(t0), e.getMessage());
             fail(responseObserver, e);
         }
     }
@@ -109,12 +150,36 @@ final class RngProxyService extends RngServiceGrpc.RngServiceImplBase {
         if (cid == null) {
             return;
         }
+        long t0 = System.nanoTime();
+        FrameMeter m = new FrameMeter();
         try {
-            enclave.serveStreamAttested(cid, request, responseObserver::onNext);
+            enclave.serveStreamAttested(cid, request, m.wrap(responseObserver));
+            audit.info("op=serveStreamAttested module_id={} cid={} req={}B frames={} replyBytes={} {}ms",
+                    request.getModuleId(), cid, request.getCiphertext().size(), m.frames, m.bytes, ms(t0));
             responseObserver.onCompleted();
         } catch (IOException e) {
+            audit.warn("op=serveStreamAttested module_id={} cid={} frames={} FAILED {}ms: {}",
+                    request.getModuleId(), cid, m.frames, ms(t0), e.getMessage());
             fail(responseObserver, e);
         }
+    }
+
+    /** Counts relayed frames + ciphertext bytes without touching the opaque payload. */
+    private static final class FrameMeter {
+        int frames;
+        long bytes;
+
+        java.util.function.Consumer<SealedMessage> wrap(StreamObserver<SealedMessage> out) {
+            return msg -> {
+                frames++;
+                bytes += msg.getCiphertext().size();
+                out.onNext(msg);
+            };
+        }
+    }
+
+    private static long ms(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000L;
     }
 
     @Override
@@ -134,6 +199,7 @@ final class RngProxyService extends RngServiceGrpc.RngServiceImplBase {
                 .setSignature(sig)
                 .build());
         responseObserver.onCompleted();
+        audit.info("op=getPcrManifest json={}B sig={}B", json.size(), sig.size());
     }
 
     /** Resolve the session's module_id to its attested CID, or fail the call and return null. */

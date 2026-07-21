@@ -37,7 +37,10 @@ message SignedResult {
 message AttestedResult {
   bytes result = 1;          // serialized RngResult
   bytes req_nonce = 2;       // must equal the request's req_nonce (== doc nonce)
-  bytes attestation_doc = 3; // COSE_Sign1; user_data = SHA256(result), nonce = req_nonce
+  bytes attestation_doc = 3; // COSE_Sign1; user_data = SHA256(request || result), nonce = req_nonce
+  bytes request = 4;         // the serialized RngOp the enclave processed — the doc binds it too,
+                             // so (request, result, doc) is self-verifiable: the enclave attests
+                             // THIS request produced THIS result, not just a bare result.
 }
 
 // ---- RNG operations (the confidential application layer) -------------------
@@ -47,6 +50,13 @@ message RngOp {
     NextInt next_int = 1;
     NextBytes next_bytes = 2;
     CommitReveal commit_reveal = 3;
+    NoiseCommitReveal noise_commit_reveal = 4;
+    // Attested Provably-Fair Round (APFR) — the generic game standard. Each is a
+    // unary attested request (RngService.ServeAttested); game-specific bodies are
+    // opaque bytes so the standard never changes per game (see games.proto).
+    RoundOpen round_open = 5;
+    RoundAction round_action = 6;
+    RoundSettle round_settle = 7;
   }
 }
 
@@ -78,12 +88,43 @@ message CommitReveal {
   uint32 delay_seconds = 3; // enclave holds the stream this long between frames
 }
 
+// ---- Noise-padded commit / reveal (enclave-pushed stream, attested) --------
+// Same two-frame held-stream flow as CommitReveal, but the committed preimage is
+// a NOISE-WRAPPED text payload, not a raw seed. The enclave rolls dice_count dice
+// in [1..dice_faces], formats them "d1-d2-...", embeds that as "{d1-d2-...}" inside
+// a random-noise string + trailing emojis, and commits hash(payload). The noise
+// makes the small result space impossible to brute-force from the commit before
+// reveal. All five noise params are sent by the client (its own config).
+//
+//   frame 1 -> NoiseCommitResult{ commit }        (flushed immediately)
+//   (enclave sleeps delay_seconds on its own clock)
+//   frame 2 -> NoiseRevealResult{ payload }
+//
+// Client checks encryptionType-hash(payload) == commit and extracts {d1-d2-...}.
+message NoiseCommitReveal {
+  int32 dice_count = 1;         // how many dice (3 = gourd-crab / tai-xiu)
+  int32 dice_faces = 2;         // faces per die (6)
+  uint32 delay_seconds = 3;     // enclave hold between the two frames
+  string session_id = 4;        // embedded verbatim in the payload
+
+  string encryption_type = 5;   // "SHA256" | "MD5"
+  bool use_encryption = 6;      // false => commit is the raw payload
+  int32 noise_string_length = 7;
+  int32 noise_emoji_length = 8;
+  double noise_adjustment = 9;  // fraction the noise length may be shortened by
+}
+
 message RngResult {
   oneof result {
     IntResult int_result = 1;
     BytesResult bytes_result = 2;
-    CommitResult commit = 3;   // stream frame 1
-    RevealResult reveal = 4;   // stream frame 2
+    CommitResult commit = 3;              // stream frame 1
+    RevealResult reveal = 4;              // stream frame 2
+    NoiseCommitResult noise_commit = 5;   // noise stream frame 1
+    NoiseRevealResult noise_reveal = 6;   // noise stream frame 2
+    RoundOpened round_opened = 7;         // APFR: round opened (commit)
+    ActionResult action_result = 8;       // APFR: action applied
+    RoundSettled round_settled = 9;       // APFR: settled (reveal)
   }
 }
 
@@ -103,4 +144,89 @@ message CommitResult {
 message RevealResult {
   bytes seed = 1;
   int64 value = 2;
+}
+
+message NoiseCommitResult {
+  string commit = 1;          // hex hash of the payload — bound before the payload is revealed
+  string encryption_type = 2; // which hash the client must use to verify ("SHA256" | "MD5")
+  uint32 delay_seconds = 3;   // echo: how long until the reveal frame arrives
+}
+
+message NoiseRevealResult {
+  string payload = 1;      // the full noise-wrapped plaintext; hash(payload) == commit
+  string result_text = 2;  // convenience: the "d1-d2-..." embedded in {..}
+}
+
+// ============================================================================
+// Attested Provably-Fair Round (APFR) — the generic game standard.
+//
+// Lifecycle:  OPEN  ->  (ACTION)*  ->  SETTLED
+//   RoundOpen   -> RoundOpened  { commit = SHA256(server_seed) }   // secret hidden
+//   RoundAction -> ActionResult { game result, status }            // 0..N, no leak
+//   RoundSettle -> RoundSettled { server_seed, outcome }           // reveal + audit
+//
+// Every step is a unary attested response (see AttestedResult / ServeAttested):
+// the NSM doc binds SHA256(request || result), so the whole round is an auditable
+// chain. Fairness: outcome = f(server_seed, client_seed, params); the client
+// checks SHA256(server_seed) == commit at settle and recomputes the outcome.
+//
+// game-specific bodies (params/action/result/outcome) are OPAQUE bytes — nested
+// game messages defined in games.proto — so this envelope never changes per game.
+// ============================================================================
+
+enum RoundKind {
+  PER_PLAYER = 0; // one attested client owns + acts + settles (mines)
+  COMMON = 1;     // one shared round, many players attach + act (aviator, dice-broadcast)
+}
+
+enum RoundStatus {
+  ROUND_OPEN = 0;
+  ROUND_WIN = 1;
+  ROUND_LOSS = 2;
+  ROUND_BUST = 3;     // e.g. mine hit
+  ROUND_EXPIRED = 4;  // TTL elapsed with no settle
+  ROUND_SETTLED = 5;  // revealed, terminal
+}
+
+message RoundOpen {
+  string game_type = 1;            // engine key, e.g. "mines" | "dice"
+  RoundKind kind = 2;
+  bytes client_seed = 3;           // client fairness contribution
+  bytes params = 4;                // game-specific (MinesParams ...), opaque here
+  string session_id = 5;
+  uint32 settle_after_seconds = 6; // optional auto-settle hint (dice/aviator hold)
+}
+
+message RoundOpened {
+  string round_id = 1;
+  string commit = 2;               // hex SHA256(server_seed) — bound before any action
+  string game_type = 3;
+  RoundKind kind = 4;
+  bytes public_params = 5;         // game public info (grid size, mine count ...)
+  int64 server_time_ms = 6;        // enclave clock at open
+}
+
+message RoundAction {
+  string round_id = 1;
+  uint32 seq = 2;                  // monotonic per round; replay/order guard
+  bytes action = 3;                // game-specific (MinesPick ...), opaque here
+}
+
+message ActionResult {
+  string round_id = 1;
+  uint32 seq = 2;
+  bytes result = 3;                // game-specific (MinesPickResult ...), opaque here
+  RoundStatus status = 4;
+}
+
+message RoundSettle {
+  string round_id = 1;
+}
+
+message RoundSettled {
+  string round_id = 1;
+  bytes server_seed = 2;           // reveal — SHA256(server_seed) == commit
+  bytes client_seed = 3;           // echo of the client contribution
+  bytes outcome = 4;               // game-specific full outcome (MinesOutcome ...)
+  RoundStatus status = 5;
 }

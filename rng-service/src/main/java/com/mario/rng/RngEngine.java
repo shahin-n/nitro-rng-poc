@@ -9,8 +9,14 @@ import com.mario.rng.app.BytesResult;
 import com.mario.rng.app.IntResult;
 import com.mario.rng.app.NextBytes;
 import com.mario.rng.app.NextInt;
+import com.mario.rng.app.NoiseCommitReveal;
+import com.mario.rng.app.NoiseCommitResult;
+import com.mario.rng.app.NoiseRevealResult;
 import com.mario.rng.app.RngOp;
 import com.mario.rng.app.RngResult;
+import com.mario.rng.reveal.NoiseConfig;
+import com.mario.rng.reveal.ResultProcessor;
+import com.mario.rng.reveal.ResultProcessorFactory;
 
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -39,11 +45,18 @@ final class RngEngine {
     record CommitRevealFrames(CommitResult commit, RevealResult reveal) {
     }
 
+    /** The two frames of one noise-padded commit-reveal (commit hash, then the noise-wrapped payload). */
+    record NoiseFrames(NoiseCommitResult commit, NoiseRevealResult reveal) {
+    }
+
     RngResult execute(RngOp op) {
         return switch (op.getOpCase()) {
             case NEXT_INT -> RngResult.newBuilder().setIntResult(nextInt(op.getNextInt())).build();
             case NEXT_BYTES -> RngResult.newBuilder().setBytesResult(nextBytes(op.getNextBytes())).build();
             case COMMIT_REVEAL -> throw new IllegalArgumentException("commit_reveal must use ServeStream");
+            case NOISE_COMMIT_REVEAL -> throw new IllegalArgumentException("noise_commit_reveal must use ServeStreamAttested");
+            case ROUND_OPEN, ROUND_ACTION, ROUND_SETTLE ->
+                    throw new IllegalArgumentException(op.getOpCase() + " must use ServeAttested");
             case OP_NOT_SET -> throw new IllegalArgumentException("empty RngOp");
         };
     }
@@ -73,6 +86,43 @@ final class RngEngine {
                 .setValue(value)
                 .build();
         return new CommitRevealFrames(commit, reveal);
+    }
+
+    /**
+     * Noise-padded commit-reveal. The DICE come from the enclave RNG ({@link RandomManager} via
+     * {@link #uniform}); the noise/emoji wrapping + commit hash come from {@link ResultProcessor}
+     * (its own SecureRandom — noise is not the result). Returns both frames; the hash binds the
+     * (later) revealed payload just like the seed variant.
+     */
+    NoiseFrames noiseCommitReveal(NoiseCommitReveal op) {
+        int count = op.getDiceCount() > 0 ? op.getDiceCount() : 3;
+        int faces = op.getDiceFaces() > 0 ? op.getDiceFaces() : 6;
+
+        StringBuilder rt = new StringBuilder();
+        for (int i = 0; i < count; i++) {
+            if (i > 0) {
+                rt.append("-");
+            }
+            rt.append(uniform(1, faces)); // each die in [1..faces], from the trusted enclave RNG
+        }
+        String resultText = rt.toString();
+
+        NoiseConfig cfg = new NoiseConfig(
+                op.getEncryptionType(), op.getUseEncryption(),
+                op.getNoiseStringLength(), op.getNoiseEmojiLength(), op.getNoiseAdjustment());
+        ResultProcessor.NoiseResult nr = ResultProcessorFactory.create(cfg)
+                .handle(op.getSessionId(), resultText);
+
+        NoiseCommitResult commit = NoiseCommitResult.newBuilder()
+                .setCommit(nr.commit())
+                .setEncryptionType(nr.encryptionType())
+                .setDelaySeconds(op.getDelaySeconds())
+                .build();
+        NoiseRevealResult reveal = NoiseRevealResult.newBuilder()
+                .setPayload(nr.payload())
+                .setResultText(resultText)
+                .build();
+        return new NoiseFrames(commit, reveal);
     }
 
     private long uniform(long min, long max) {

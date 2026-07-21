@@ -163,6 +163,34 @@ final class EnclaveSession {
     }
 
     /**
+     * Step C (unary, per-response attested) — HPKE-seal the op, one attested reply. Backs the APFR
+     * round ops (RoundOpen/RoundAction/RoundSettle): the reply's own fresh NSM doc binds
+     * SHA256(request || result) and echoes the request, so each round step is self-verifiable and
+     * bound to the exact op we sent. Reuses {@link #openVerifyAttested}.
+     */
+    RngResult callAttested(RngOp op) throws Exception {
+        Pinned p = ensureFresh();
+        AsymmetricCipherKeyPair gameKp = hpke.generateKeyPair();
+        byte[] gamePub = hpke.serializePublic(gameKp);
+        byte[] reqNonce = new byte[16];
+        random.nextBytes(reqNonce);
+
+        byte[] sealedReq = SealedRequest.newBuilder()
+                .setOp(op.toByteString())
+                .setGamePub(ByteString.copyFrom(gamePub))
+                .setReqNonce(ByteString.copyFrom(reqNonce))
+                .build()
+                .toByteArray();
+        byte[] ciphertext = hpke.seal(p.encPub(), sealedReq);
+
+        SealedMessage reply = stub.serveAttested(SealedMessage.newBuilder()
+                .setCiphertext(ByteString.copyFrom(ciphertext))
+                .setModuleId(p.moduleId())
+                .build());
+        return openVerifyAttested(reply, gameKp, reqNonce, p, op.toByteArray());
+    }
+
+    /**
      * Step C (streaming) — HPKE-seal the op once, then consume the enclave-pushed stream. Each
      * frame is independently opened, replay-checked and signature-verified, then handed to
      * {@code onResult}. Used by commit-reveal: frame 1 is the commit hash, frame 2 (after the
@@ -217,13 +245,14 @@ final class EnclaveSession {
                 .toByteArray();
         byte[] ciphertext = hpke.seal(p.encPub(), sealedReq);
 
+        byte[] opBytes = op.toByteArray();
         Iterator<SealedMessage> frames = stub.serveStreamAttested(SealedMessage.newBuilder()
                 .setCiphertext(ByteString.copyFrom(ciphertext))
                 .setModuleId(p.moduleId())
                 .build());
         int n = 0;
         while (frames.hasNext()) {
-            RngResult result = openVerifyAttested(frames.next(), gameKp, reqNonce, p);
+            RngResult result = openVerifyAttested(frames.next(), gameKp, reqNonce, p, opBytes);
             log.debug("attested stream frame {} OK module={}", ++n, p.moduleId());
             onResult.accept(result);
         }
@@ -250,18 +279,23 @@ final class EnclaveSession {
      * bind the doc to the result (user_data == SHA256(result)), and confirm it's the same enclave
      * module the session pinned. Returns the verified result.
      */
-    private RngResult openVerifyAttested(SealedMessage reply, AsymmetricCipherKeyPair gameKp, byte[] reqNonce, Pinned p)
-            throws Exception {
+    private RngResult openVerifyAttested(SealedMessage reply, AsymmetricCipherKeyPair gameKp, byte[] reqNonce,
+                                         Pinned p, byte[] expectedOp) throws Exception {
         byte[] plain = hpke.open(reply.getCiphertext().toByteArray(), gameKp);
         AttestedResult ar = AttestedResult.parseFrom(plain);
         if (!MessageDigest.isEqual(reqNonce, ar.getReqNonce().toByteArray())) {
             throw new SecurityException("req_nonce mismatch — possible replay");
         }
         byte[] resultBytes = ar.getResult().toByteArray();
+        byte[] reqBytes = ar.getRequest().toByteArray();
+        // The doc must bind the request WE sent — the enclave attested this exact op produced this result.
+        if (!MessageDigest.isEqual(reqBytes, expectedOp)) {
+            throw new SecurityException("attested request != op sent — wrong/tampered request");
+        }
         // Full hardware attestation of THIS response; verify() checks nonce == req_nonce.
         AttestationDocument doc = verifier.verify(ar.getAttestationDoc().toByteArray(), reqNonce);
-        if (doc.userData == null || !MessageDigest.isEqual(doc.userData, sha256(resultBytes))) {
-            throw new SecurityException("attestation user_data != SHA256(result)");
+        if (doc.userData == null || !MessageDigest.isEqual(doc.userData, sha256(concat(reqBytes, resultBytes)))) {
+            throw new SecurityException("attestation user_data != SHA256(request || result)");
         }
         if (!doc.moduleId.equals(p.moduleId())) {
             throw new SecurityException("attested module_id != session module — wrong enclave");

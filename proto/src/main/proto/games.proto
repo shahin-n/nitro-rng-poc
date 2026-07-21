@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package rng.app.v1;
+
+option java_multiple_files = true;
+option java_package = "com.mario.rng.app";
+option java_outer_classname = "GamesProto";
+
+// ----------------------------------------------------------------------------
+// Game-specific bodies for the Attested Provably-Fair Round standard (app.proto).
+// These are serialized into the OPAQUE bytes fields of RoundOpen.params,
+// RoundAction.action, ActionResult.result and RoundSettled.outcome — so the
+// generic round envelope never changes when a new game is added.
+// ----------------------------------------------------------------------------
+
+// ---- Mines (per-player) ----------------------------------------------------
+// A rows*cols grid with `mines` hidden mines fixed at open (derived from the
+// seed). The player picks cells one per RoundAction; a mine busts the round.
+// At settle the full mine layout is revealed and audited against the commit.
+
+message MinesParams {
+  uint32 rows = 1;
+  uint32 cols = 2;
+  uint32 mines = 3;
+}
+
+message MinesPick {
+  uint32 cell = 1; // 0-based index in [0, rows*cols)
+}
+
+message MinesPickResult {
+  bool is_mine = 1;          // true => round busts
+  uint32 safe_revealed = 2;  // count of safe cells picked so far
+  double multiplier = 3;     // running payout multiplier for safe picks
+}
+
+message MinesOutcome {
+  repeated uint32 mine_cells = 1; // the full layout, revealed at settle
+}

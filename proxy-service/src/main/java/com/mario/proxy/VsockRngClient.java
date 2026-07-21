@@ -27,6 +27,7 @@ final class VsockRngClient {
     static final int TAG_SERVE = 'S';
     static final int TAG_STREAM = 'C';
     static final int TAG_STREAM_ATTESTED = 'D';
+    static final int TAG_SERVE_ATTESTED = 'E';
 
     private final int port;
 
@@ -46,10 +47,19 @@ final class VsockRngClient {
     }
 
     SealedMessage serve(int cid, SealedMessage req) throws IOException {
+        return unary(TAG_SERVE, cid, req);
+    }
+
+    /** APFR round op — one opaque request, one NSM-attested opaque reply. */
+    SealedMessage serveAttested(int cid, SealedMessage req) throws IOException {
+        return unary(TAG_SERVE_ATTESTED, cid, req);
+    }
+
+    private SealedMessage unary(int tag, int cid, SealedMessage req) throws IOException {
         try (AFVSOCKSocket s = connect(cid);
              OutputStream out = s.getOutputStream();
              InputStream in = s.getInputStream()) {
-            out.write(TAG_SERVE);
+            out.write(tag);
             req.writeDelimitedTo(out);
             out.flush();
             return SealedMessage.parseDelimitedFrom(in);
